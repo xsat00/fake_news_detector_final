@@ -1,3 +1,12 @@
 streamlit==1.45.1
 torch==2.0.1+cpu
 -f https://download.pytorch.org/whl/torch_stable.html
+numpy==2.2.6
+pandas==2.2.3
+opencv_python==4.11.0.86
+langdetect==1.0.9
+python-dotenv==1.1.0
+pytesseract==0.3.13
+scikit-image==0.19.3
+bardapi==1.0.0
+yt_dlp==2025.5.22
