@@ -3,7 +3,7 @@ import re
 import time
 import torch
 import types
-from dotenv import load_dotenv
+import streamlit as st
 
 # PyTorch + Streamlit fix (optional)
 if isinstance(torch.classes, types.ModuleType):
@@ -12,12 +12,7 @@ if isinstance(torch.classes, types.ModuleType):
     except Exception:
         pass
 
-import streamlit as st
-
-# Load environment variables from .env file
-load_dotenv()
-
-# Import your utility functions or mock them if missing
+# --- Import your utils ---
 try:
     from utils.downloader import download_audio_from_youtube, download_video_from_youtube
     from utils.transcriber import transcribe_audio, load_whisper_model
@@ -25,17 +20,17 @@ try:
     from utils.verifier import verify_with_bard
     from utils.video_processor import analyze_video_for_duplicates, extract_visible_text_from_frames
 except ImportError:
-    # Mock implementations for testing
+    # Mock implementations for demonstration/testing
     def download_audio_from_youtube(url): return "audio.mp3"
     def download_video_from_youtube(url): return ("video.mp4", None, None)
     def transcribe_audio(model, audio_path): return "This is a test transcript."
     def load_whisper_model(): return None
     def detect_language(text): return "en"
     def detect_trigger_words(text, lang): 
-        # Simple example trigger words check
         example_triggers = {"en": ["fake", "false", "misinformation"]}
         return [w for w in example_triggers.get(lang, []) if w in text.lower()]
-    def verify_with_bard(text): return "This news appears to be false because it contains misinformation."
+    def verify_with_bard(text, api_key=None): 
+        return "This news appears to be false because it contains misinformation."
     def analyze_video_for_duplicates(video_path):
         return {
             "total_frames_extracted": 100,
@@ -44,6 +39,7 @@ except ImportError:
         }
     def extract_visible_text_from_frames(video_path): return "Visible text from video frames."
 
+# Helpers
 def remove_timestamps_and_tags(text):
     text = re.sub(r'\b\d{1,2}:\d{2}(:\d{2}(\.\d{1,3})?)?\b', '', text)
     text = re.sub(r'<[^>]+>', '', text)
@@ -64,8 +60,9 @@ def create_verification_prompt(text):
     )
 
 @st.cache_data(show_spinner=False)
-def cached_verify_with_bard(text):
-    return verify_with_bard(text)
+def cached_verify_with_bard(text, api_key):
+    # Pass api_key to your real verify_with_bard
+    return verify_with_bard(text, api_key=api_key)
 
 def get_youtube_thumbnail_fallback(url):
     video_id_match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", url)
@@ -83,7 +80,7 @@ def vtt_to_plaintext(vtt_path):
             text_lines.append(line)
     return " ".join(text_lines)
 
-def process_video_and_audio(video_path, audio_path, subtitle_path, downloaded_thumbnail, url):
+def process_video_and_audio(video_path, audio_path, subtitle_path, downloaded_thumbnail, url, bard_api_key):
     st.write("Analyzing video...")
 
     model = load_whisper_model()
@@ -141,7 +138,7 @@ def process_video_and_audio(video_path, audio_path, subtitle_path, downloaded_th
     with st.spinner("Getting verification..."):
         try:
             start_verify = time.time()
-            verification = cached_verify_with_bard(verification_prompt)
+            verification = cached_verify_with_bard(verification_prompt, bard_api_key)
             verify_time = time.time() - start_verify
             confidence = 0.9
         except Exception as e:
@@ -155,9 +152,11 @@ def process_video_and_audio(video_path, audio_path, subtitle_path, downloaded_th
         st.write(f"⏱ Verification time: **{verify_time:.2f} sec**")
 
 def main():
-    if not os.getenv("BARD_API_KEY"):
-        st.error("❌ BARD_API_KEY not set in .env file.")
+    if "BARD_API_KEY" not in st.secrets:
+        st.error("❌ BARD_API_KEY not found in Streamlit secrets.")
         return
+
+    bard_api_key = st.secrets["BARD_API_KEY"]
 
     st.set_page_config(
         page_title="Fake News Detection App",
@@ -184,7 +183,7 @@ def main():
             with st.spinner("Verifying with Bard..."):
                 try:
                     start = time.time()
-                    verification = cached_verify_with_bard(verification_prompt)
+                    verification = cached_verify_with_bard(verification_prompt, bard_api_key)
                     elapsed = time.time() - start
                     confidence = 0.85
                 except Exception as e:
@@ -209,7 +208,7 @@ def main():
                     return
 
                 if video_path and audio_path:
-                    process_video_and_audio(video_path, audio_path, subtitle_path, downloaded_thumbnail, url)
+                    process_video_and_audio(video_path, audio_path, subtitle_path, downloaded_thumbnail, url, bard_api_key)
                 else:
                     st.error("Video or audio download failed.")
 
@@ -219,10 +218,10 @@ def main():
             video_path = f"/tmp/{uploaded_video.name}"
             with open(video_path, "wb") as f:
                 f.write(uploaded_video.getbuffer())
-            audio_path = video_path  # Assuming audio embedded
+            audio_path = video_path  # assuming audio embedded in video
             subtitle_path = None
             downloaded_thumbnail = None
-            process_video_and_audio(video_path, audio_path, subtitle_path, downloaded_thumbnail, None)
+            process_video_and_audio(video_path, audio_path, subtitle_path, downloaded_thumbnail, None, bard_api_key)
 
 if __name__ == "__main__":
     main()
