@@ -1,227 +1,226 @@
+import streamlit as st
+import yt_dlp
+import tempfile
 import os
+import cv2
+from PIL import Image
+import pytesseract
+from langdetect import detect
+import hashlib
+import whisper
+import numpy as np
+import json
 import re
 import time
-import torch
-import types
-import streamlit as st
 
-# PyTorch + Streamlit fix (optional)
-if isinstance(torch.classes, types.ModuleType):
-    try:
-        torch.classes.__path__ = []
-    except Exception:
-        pass
+# === Configuration ===
+MAX_FRAMES = 50  # max frames to process to limit runtime
+TRIGGER_WORDS_FILE = "trigger_words.json"  # load trigger words JSON
+WHISPER_MODEL = "base"  # Whisper model name
 
-# --- Import your utils ---
-try:
-    from utils.downloader import download_audio_from_youtube, download_video_from_youtube
-    from utils.transcriber import transcribe_audio, load_whisper_model
-    from utils.text_analyzer import detect_language, detect_trigger_words
-    from utils.verifier import verify_with_bard
-    from utils.video_processor import analyze_video_for_duplicates, extract_visible_text_from_frames
-except ImportError:
-    # Mock implementations for demonstration/testing
-    def download_audio_from_youtube(url): return "audio.mp3"
-    def download_video_from_youtube(url): return ("video.mp4", None, None)
-    def transcribe_audio(model, audio_path): return "This is a test transcript."
-    def load_whisper_model(): return None
-    def detect_language(text): return "en"
-    def detect_trigger_words(text, lang): 
-        example_triggers = {"en": ["fake", "false", "misinformation"]}
-        return [w for w in example_triggers.get(lang, []) if w in text.lower()]
-    def verify_with_bard(text, api_key=None): 
-        return "This news appears to be false because it contains misinformation."
-    def analyze_video_for_duplicates(video_path):
+# === Load Trigger Words ===
+@st.cache_data
+def load_trigger_words():
+    if os.path.exists(TRIGGER_WORDS_FILE):
+        with open(TRIGGER_WORDS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    else:
+        # fallback example trigger words in English + Hindi (add more)
         return {
-            "total_frames_extracted": 100,
-            "duplicate_count": 5,
-            "duplicate_frame_pairs": [{"frame1": 10, "frame2": 15}]
+            "en": ["fake", "hoax", "rumor", "false", "misinformation"],
+            "hi": ["झूठा", "फेक", "अफवाह", "गलत"],
         }
-    def extract_visible_text_from_frames(video_path): return "Visible text from video frames."
 
-# Helpers
-def remove_timestamps_and_tags(text):
-    text = re.sub(r'\b\d{1,2}:\d{2}(:\d{2}(\.\d{1,3})?)?\b', '', text)
-    text = re.sub(r'<[^>]+>', '', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+trigger_words = load_trigger_words()
 
-def clean_extracted_text(text):
-    if not text:
-        return ""
-    return remove_timestamps_and_tags(text)
+# === Helper Functions ===
 
-def create_verification_prompt(text):
-    return (
-        "Please analyze the following news content and answer:\n"
-        "- Is this news genuine (true) or false?\n"
-        "- Provide reasons supporting your conclusion.\n\n"
-        f"News content:\n{text}"
-    )
+def download_video(url):
+    temp_dir = tempfile.mkdtemp()
+    ydl_opts = {
+        'format': 'best',
+        'outtmpl': os.path.join(temp_dir, 'video.%(ext)s'),
+        'quiet': True,
+        'no_warnings': True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        path = ydl.prepare_filename(info)
+    return path
 
-@st.cache_data(show_spinner=False)
-def cached_verify_with_bard(text, api_key):
-    # Pass api_key to your real verify_with_bard
-    return verify_with_bard(text, api_key=api_key)
+def extract_frames(video_path, max_frames=MAX_FRAMES):
+    vidcap = cv2.VideoCapture(video_path)
+    frames = []
+    count = 0
+    success = True
+    while success and count < max_frames:
+        success, frame = vidcap.read()
+        if success:
+            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            count += 1
+    vidcap.release()
+    return frames
 
-def get_youtube_thumbnail_fallback(url):
-    video_id_match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", url)
-    if video_id_match:
-        return f"https://img.youtube.com/vi/{video_id_match.group(1)}/0.jpg"
-    return None
+def frame_hash(frame):
+    """Create a hash of the image frame for duplicate detection"""
+    img = Image.fromarray(frame).resize((64,64)).convert('L')  # grayscale small thumbnail
+    return hashlib.md5(img.tobytes()).hexdigest()
 
-def vtt_to_plaintext(vtt_path):
-    text_lines = []
-    with open(vtt_path, 'r', encoding='utf-8', errors='ignore') as file:
-        for line in file:
-            line = line.strip()
-            if not line or '-->' in line or re.match(r'^\d+$', line):
-                continue
-            text_lines.append(line)
-    return " ".join(text_lines)
+def detect_duplicate_frames(frames):
+    hashes = [frame_hash(f) for f in frames]
+    duplicates = {}
+    for i, h in enumerate(hashes):
+        duplicates.setdefault(h, []).append(i)
+    # Keep only hashes with duplicates (more than 1 frame)
+    return {k:v for k,v in duplicates.items() if len(v) > 1}
 
-def process_video_and_audio(video_path, audio_path, subtitle_path, downloaded_thumbnail, url, bard_api_key):
-    st.write("Analyzing video...")
+def ocr_on_frames(frames):
+    texts = []
+    for f in frames:
+        pil_img = Image.fromarray(f)
+        text = pytesseract.image_to_string(pil_img).strip()
+        texts.append(text)
+    return texts
 
-    model = load_whisper_model()
+def detect_language(text):
+    try:
+        return detect(text)
+    except:
+        return "unknown"
 
-    thumbnail_url = None
-    if downloaded_thumbnail and os.path.exists(downloaded_thumbnail):
-        thumbnail_url = downloaded_thumbnail
-    elif url:
-        thumbnail_url = get_youtube_thumbnail_fallback(url)
-    if thumbnail_url:
-        st.image(thumbnail_url, caption="Thumbnail", use_column_width=True)
+def scan_trigger_words(texts, trigger_words):
+    """Scan texts for any trigger words per language"""
+    hits = []
+    for text in texts:
+        lang = detect_language(text)
+        tw_list = trigger_words.get(lang, []) + trigger_words.get("en", [])
+        for tw in tw_list:
+            if re.search(r"\b" + re.escape(tw) + r"\b", text, re.IGNORECASE):
+                hits.append((lang, tw, text))
+    return hits
 
-    with st.spinner("Transcribing audio..."):
-        start_transcribe = time.time()
-        transcript = transcribe_audio(model, audio_path)
-        trans_time = time.time() - start_transcribe
+def transcribe_audio(video_path):
+    model = whisper.load_model(WHISPER_MODEL)
+    result = model.transcribe(video_path)
+    return result["text"]
 
-    with st.spinner("Checking for duplicate frames..."):
-        start_dup = time.time()
-        duplicate_report = analyze_video_for_duplicates(video_path)
-        dup_time = time.time() - start_dup
+def clean_text(text):
+    return text.strip().replace("\n", " ")
 
-    st.write(f"🧩 Frames extracted: {duplicate_report['total_frames_extracted']}")
-    st.write(f"🔁 Duplicates: {duplicate_report['duplicate_count']}")
-    st.write(f"⏱ Duplicate analysis: **{dup_time:.2f} sec**")
-    if duplicate_report['duplicate_count'] > 0:
-        with st.expander("Duplicate Frame Pairs"):
-            st.dataframe(duplicate_report['duplicate_frame_pairs'])
+# Placeholder Bard API call function (replace with your real API calls)
+def fact_check_script(script_text):
+    # This should call your Bard or other API for fact checking.
+    # Here just a stub:
+    time.sleep(1)  # simulate delay
+    if "fake" in script_text.lower() or "hoax" in script_text.lower():
+        return "⚠️ Warning: Script contains suspicious content."
+    else:
+        return "✅ Script appears genuine."
 
-    st.text_area("📝 Transcript", transcript, height=200)
-    st.write(f"⏱ Transcription: **{trans_time:.2f} sec**")
+# === Streamlit UI ===
 
-    lang = detect_language(transcript)
-    triggers = detect_trigger_words(transcript, lang)
-    st.write(f"🌐 Language: `{lang}`")
-    st.write(f"🚨 Trigger words: {triggers if triggers else 'None'}")
+st.title("🚩 Fake News Detection App")
 
-    subtitle_text = ""
-    if subtitle_path and os.path.exists(subtitle_path):
-        subtitle_text = vtt_to_plaintext(subtitle_path)
-        with st.expander("📺 Subtitles"):
-            st.text_area("Extracted Subtitles", subtitle_text, height=150)
+st.markdown("""
+Upload a video file or provide a YouTube URL. The app will:
+- Extract frames and detect duplicates
+- Run OCR on frames for visible text detection
+- Extract and transcribe audio script (supports multiple languages)
+- Scan text for fake news trigger words
+- Fact check the transcribed script with Bard API (placeholder)
+""")
 
-    with st.spinner("Extracting text from video frames..."):
-        frame_text = extract_visible_text_from_frames(video_path)
-    if frame_text:
-        with st.expander("🔤 Text in Frames"):
-            st.text_area("Detected Text", frame_text, height=150)
+input_type = st.radio("Select input type:", ["YouTube URL", "Upload Video"])
 
-    combined_text = "\n".join(filter(None, [transcript, subtitle_text, frame_text]))
-    combined_text = clean_extracted_text(combined_text)
+video_path = None
+if input_type == "YouTube URL":
+    url = st.text_input("Enter YouTube URL:")
+    if url:
+        with st.spinner("Downloading video..."):
+            try:
+                video_path = download_video(url)
+                st.success("Downloaded video successfully.")
+            except Exception as e:
+                st.error(f"Error downloading video: {e}")
+elif input_type == "Upload Video":
+    uploaded = st.file_uploader("Upload your video file", type=["mp4","mov","avi","mkv"])
+    if uploaded is not None:
+        temp_file = tempfile.NamedTemporaryFile(delete=False)
+        temp_file.write(uploaded.read())
+        temp_file.flush()
+        video_path = temp_file.name
+        st.success("Uploaded video successfully.")
 
-    st.write("Verifying content...")
-    verification_prompt = create_verification_prompt(combined_text)
-    with st.spinner("Getting verification..."):
+if video_path:
+    # Extract frames
+    with st.spinner("Extracting frames..."):
+        frames = extract_frames(video_path)
+        st.write(f"Extracted {len(frames)} frames.")
+
+    # Duplicate frames detection
+    with st.spinner("Detecting duplicate frames..."):
+        duplicates = detect_duplicate_frames(frames)
+        if duplicates:
+            st.warning(f"Found {len(duplicates)} sets of duplicate frames.")
+            for h, idxs in duplicates.items():
+                st.write(f"Duplicate frame indexes: {idxs}")
+        else:
+            st.success("No duplicate frames detected.")
+
+    # OCR on frames
+    with st.spinner("Running OCR on frames..."):
+        ocr_texts = ocr_on_frames(frames)
+
+    st.subheader("Sample OCR Extracted Texts (First 5 frames):")
+    for i, text in enumerate(ocr_texts[:5]):
+        lang = detect_language(text) if text else "No text"
+        st.markdown(f"**Frame {i+1} (lang: {lang}):**")
+        st.text(text if text else "No visible text detected")
+
+    # Scan trigger words in OCR texts
+    ocr_hits = scan_trigger_words(ocr_texts, trigger_words)
+    if ocr_hits:
+        st.error(f"Trigger words detected in OCR texts:")
+        for lang, word, txt in ocr_hits:
+            st.write(f"- Language: {lang} | Word: '{word}' | Text snippet: {txt[:100]}...")
+    else:
+        st.success("No trigger words detected in OCR texts.")
+
+    # Transcribe audio
+    with st.spinner("Transcribing audio (this may take a while)..."):
         try:
-            start_verify = time.time()
-            verification = cached_verify_with_bard(verification_prompt, bard_api_key)
-            verify_time = time.time() - start_verify
-            confidence = 0.9
+            transcription = transcribe_audio(video_path)
+            cleaned_script = clean_text(transcription)
+            st.subheader("Transcribed Audio Script:")
+            st.write(cleaned_script)
         except Exception as e:
-            verification = f"Bard API error: {e}"
-            confidence = None
+            st.error(f"Audio transcription failed: {e}")
+            transcription = None
 
-    st.write("✅ **Verification Result:**")
-    st.write(verification)
-    if confidence is not None:
-        st.write(f"🔍 Confidence: **{confidence * 100:.2f}%**")
-        st.write(f"⏱ Verification time: **{verify_time:.2f} sec**")
+    # Scan trigger words in transcription
+    if transcription:
+        script_hits = scan_trigger_words([transcription], trigger_words)
+        if script_hits:
+            st.error(f"Trigger words detected in audio transcription:")
+            for lang, word, txt in script_hits:
+                st.write(f"- Language: {lang} | Word: '{word}'")
+        else:
+            st.success("No trigger words detected in audio transcription.")
 
-def main():
-    if "BARD_API_KEY" not in st.secrets:
-        st.error("❌ BARD_API_KEY not found in Streamlit secrets.")
-        return
+    # Fact-check script via Bard (placeholder)
+    if transcription:
+        with st.spinner("Fact-checking the script..."):
+            fact_check_result = fact_check_script(transcription)
+            if fact_check_result.startswith("⚠️"):
+                st.error(fact_check_result)
+            else:
+                st.success(fact_check_result)
 
-    bard_api_key = st.secrets["BARD_API_KEY"]
-
-    st.set_page_config(
-        page_title="Fake News Detection App",
-        page_icon="icon.ico"
-    )
-
-    st.title("Fake News Detection App")
-
-    input_type = st.radio("Select input type:", ("Text", "YouTube URL", "Upload Video File"))
-
-    if input_type == "Text":
-        uploaded_file = st.file_uploader("Upload a text file (.txt)", type=["txt"])
-        if uploaded_file:
-            raw_text = uploaded_file.read().decode("utf-8", errors="ignore")
-            lang = detect_language(raw_text)
-            triggers = detect_trigger_words(raw_text, lang)
-
-            st.write(f"🌐 Language detected: `{lang}`")
-            st.write(f"🚨 Trigger words: {triggers if triggers else 'None'}")
-
-            cleaned_text = clean_extracted_text(raw_text)
-            verification_prompt = create_verification_prompt(cleaned_text)
-
-            with st.spinner("Verifying with Bard..."):
-                try:
-                    start = time.time()
-                    verification = cached_verify_with_bard(verification_prompt, bard_api_key)
-                    elapsed = time.time() - start
-                    confidence = 0.85
-                except Exception as e:
-                    verification = f"Bard API error: {e}"
-                    confidence = None
-
-            st.write("✅ **Verification Result:**")
-            st.write(verification)
-            if confidence is not None:
-                st.write(f"🔍 Confidence: **{confidence * 100:.2f}%**")
-                st.write(f"⏱ Verification time: **{elapsed:.2f} sec**")
-
-    elif input_type == "YouTube URL":
-        url = st.text_input("Enter YouTube video URL")
-        if url:
-            with st.spinner("Downloading and processing video/audio..."):
-                try:
-                    video_path, subtitle_path, downloaded_thumbnail = download_video_from_youtube(url)
-                    audio_path = download_audio_from_youtube(url)
-                except Exception as e:
-                    st.error(f"Download failed: {e}")
-                    return
-
-                if video_path and audio_path:
-                    process_video_and_audio(video_path, audio_path, subtitle_path, downloaded_thumbnail, url, bard_api_key)
-                else:
-                    st.error("Video or audio download failed.")
-
-    elif input_type == "Upload Video File":
-        uploaded_video = st.file_uploader("Upload a video file", type=["mp4", "mov", "avi", "mkv"])
-        if uploaded_video:
-            video_path = f"/tmp/{uploaded_video.name}"
-            with open(video_path, "wb") as f:
-                f.write(uploaded_video.getbuffer())
-            audio_path = video_path  # assuming audio embedded in video
-            subtitle_path = None
-            downloaded_thumbnail = None
-            process_video_and_audio(video_path, audio_path, subtitle_path, downloaded_thumbnail, None, bard_api_key)
-
-if __name__ == "__main__":
-    main()
+# Cleanup button (optional)
+if st.button("Clear temporary video files"):
+    try:
+        if video_path and os.path.exists(video_path):
+            os.remove(video_path)
+        st.success("Temporary files cleared.")
+    except Exception as e:
+        st.error(f"Error clearing temp files: {e}")
