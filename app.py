@@ -14,10 +14,10 @@ if isinstance(torch.classes, types.ModuleType):
 
 import streamlit as st
 
-# Load environment variables
+# Load environment variables from .env file
 load_dotenv()
 
-# Mock implementations of your utils if missing
+# Import your utility functions or mock them if missing
 try:
     from utils.downloader import download_audio_from_youtube, download_video_from_youtube
     from utils.transcriber import transcribe_audio, load_whisper_model
@@ -25,13 +25,18 @@ try:
     from utils.verifier import verify_with_bard
     from utils.video_processor import analyze_video_for_duplicates, extract_visible_text_from_frames
 except ImportError:
+    # Mock implementations for testing
     def download_audio_from_youtube(url): return "audio.mp3"
     def download_video_from_youtube(url): return ("video.mp4", None, None)
     def transcribe_audio(model, audio_path): return "This is a test transcript."
     def load_whisper_model(): return None
     def detect_language(text): return "en"
+    def detect_trigger_words(text, lang): 
+        # Simple example trigger words check
+        example_triggers = {"en": ["fake", "false", "misinformation"]}
+        return [w for w in example_triggers.get(lang, []) if w in text.lower()]
     def verify_with_bard(text): return "This news appears to be false because it contains misinformation."
-    def analyze_video_for_duplicates(video_path): 
+    def analyze_video_for_duplicates(video_path):
         return {
             "total_frames_extracted": 100,
             "duplicate_count": 5,
@@ -214,7 +219,7 @@ def main():
             video_path = f"/tmp/{uploaded_video.name}"
             with open(video_path, "wb") as f:
                 f.write(uploaded_video.getbuffer())
-            audio_path = video_path  # Assuming embedded audio
+            audio_path = video_path  # Assuming audio embedded
             subtitle_path = None
             downloaded_thumbnail = None
             process_video_and_audio(video_path, audio_path, subtitle_path, downloaded_thumbnail, None)
